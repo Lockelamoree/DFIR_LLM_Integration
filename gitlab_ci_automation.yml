@@ -1,0 +1,74 @@
+stages:
+  - analyze
+
+variables:
+  HAYABUSA_URL: "https://github.com/Yamato-Security/hayabusa/releases/latest/download/hayabusa-windows-x64.zip"
+  HAYABUSA_DIR: "hayabusa"
+  EVENT_LOG: "security.evtx"  # Muss im Repository liegen oder als Artifact bereitgestellt werden
+  REPORT_PATH: "hayabusa_report.json"
+  NINA_API_URL: "http://open-webui.local/api/nina/evaluate"
+
+analyze_eventlog:
+  stage: analyze
+  image: python:3.10
+  script:
+    - apt-get update && apt-get install -y unzip curl
+    - pip install requests
+    # Hayabusa herunterladen
+    - echo "[*] Lade Hayabusa herunter..."
+    - mkdir -p $HAYABUSA_DIR
+    - curl -L "$HAYABUSA_URL" -o hayabusa.zip
+    - unzip hayabusa.zip -d $HAYABUSA_DIR
+    - chmod +x $HAYABUSA_DIR/hayabusa.exe
+
+    # Prüfe Eventlog-Datei
+    - |
+      if [ ! -f "$EVENT_LOG" ]; then
+        echo "[!] Eventlog-Datei nicht gefunden: $EVENT_LOG"
+        exit 1
+      fi
+
+    # Hayabusa Scan ausführen
+    - echo "[*] Starte Hayabusa Scan..."
+    - ./$HAYABUSA_DIR/hayabusa.exe scan $EVENT_LOG --json $REPORT_PATH
+
+    # Bericht prüfen
+    - |
+      if [ ! -f "$REPORT_PATH" ]; then
+        echo "[!] Hayabusa Bericht nicht erstellt!"
+        exit 1
+      fi
+
+    # Bericht an NiNa API senden
+    - echo "[*] Sende Bericht an NiNa..."
+    - |
+      python3 <<EOF
+      import json
+      import requests
+
+      with open("$REPORT_PATH", "r", encoding="utf-8") as f:
+          report = json.load(f)
+
+      headers = {"Content-Type": "application/json"}
+
+      response = requests.post(
+          "$NINA_API_URL",
+          headers=headers,
+          json={
+              "input": json.dumps(report),
+              "instruction": "Bewerte den Bericht nach Kritikalität."
+          }
+      )
+
+      if response.status_code != 200:
+          print(f"[!] API Fehler: {response.status_code}")
+          print(response.text)
+          exit(1)
+
+      print("\n[+] NiNa Bewertung:")
+      print(response.json().get("output") or response.json())
+      EOF
+  artifacts:
+    paths:
+      - hayabusa_report.json
+    expire_in: 1 week
