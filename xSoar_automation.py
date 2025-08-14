@@ -51,16 +51,29 @@ def validate_log_file(path):
     print(f"[+] Event Log gefunden: {path}")
 
 # === Schritt 2: Hayabusa Scan durchführen ===
-def run_hayabusa(log_path, output_path):
+def run_hayabusa(evtx_dir, output_dir):
+    import subprocess
+    import os
+
     print("[*] Starte Hayabusa Scan...")
-    cmd = [HAYABUSA_EXE, "scan", log_path, "--json", output_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Entspricht deinem Shell-Befehl:
+    # printf "3\nyes\n" | script -q -c "./hayabusa-2.19.0-lin-x64-gnu csv-timeline -H report.html -d ${EVTX_DIR} -o ${OUTPUT_DIR}" /dev/null
+    cmd = (
+        f'printf "3\\nyes\\n" | '
+        f'script -q -c "./hayabusa-2.19.0-lin-x64-gnu csv-timeline '
+        f'-H report.html -d {evtx_dir} -o {output_dir}" /dev/null'
+    )
+
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
     if result.returncode != 0:
         print(f"[!] Fehler bei Hayabusa:\n{result.stderr}")
         raise RuntimeError("Hayabusa Analyse fehlgeschlagen.")
-    print(f"[+] Hayabusa Bericht gespeichert unter: {output_path}")
 
+    report_html = os.path.join(output_dir, "report.html")
+    print(f"[+] Hayabusa Bericht gespeichert unter: {report_html}")
+    return report_html  # <- für Schritt 3
 # === Schritt 3: Bericht laden ===
 def load_report(path):
     with open(path, "r", encoding="utf-8") as file:
