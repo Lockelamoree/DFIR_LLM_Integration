@@ -2,73 +2,114 @@ stages:
   - analyze
 
 variables:
-  HAYABUSA_URL: "https://github.com/Yamato-Security/hayabusa/releases/latest/download/hayabusa-windows-x64.zip"
+  # Linux x64 (GNU) Binary – passend für python:3.10 (Linux)
+  HAYABUSA_URL: "https://github.com/Yamato-Security/hayabusa/releases/latest/download/hayabusa-lin-x64-gnu.zip"
   HAYABUSA_DIR: "hayabusa"
-  EVENT_LOG: "security.evtx"  # Muss im Repository liegen oder als Artifact bereitgestellt werden
-  REPORT_PATH: "hayabusa_report.json"
+  # EVENT_LOG kann Datei ODER Verzeichnis sein (liegt im Repo oder als Artifact vor)
+  EVENT_LOG: "security.evtx"
+  REPORT_DIR: "hayabusa_report"
+  REPORT_HTML: "report.html"
   NINA_API_URL: "http://open-webui.local/api/nina/evaluate"
 
 analyze_eventlog:
   stage: analyze
   image: python:3.10
   script:
-    - apt-get update && apt-get install -y unzip curl
-    - pip install requests
+    - apt-get update && apt-get install -y unzip curl ca-certificates && update-ca-certificates
+    - pip install --no-cache-dir requests beautifulsoup4
+
     # Hayabusa herunterladen
-    - echo "[*] Lade Hayabusa herunter..."
-    - mkdir -p $HAYABUSA_DIR
+    - echo "[*] Lade Hayabusa (Linux x64) herunter..."
+    - mkdir -p "$HAYABUSA_DIR"
     - curl -L "$HAYABUSA_URL" -o hayabusa.zip
-    - unzip hayabusa.zip -d $HAYABUSA_DIR
-    - chmod +x $HAYABUSA_DIR/hayabusa.exe
+    - unzip -q hayabusa.zip -d "$HAYABUSA_DIR"
 
-    # Prüfe Eventlog-Datei
+    # Executable finden (Versionsname variiert), ausführbar machen
+    - HAYABUSA_BIN="$(find "$HAYABUSA_DIR" -type f -maxdepth 2 -name 'hayabusa*-lin-*-gnu' -print -quit)"
     - |
-      if [ ! -f "$EVENT_LOG" ]; then
-        echo "[!] Eventlog-Datei nicht gefunden: $EVENT_LOG"
+      if [ -z "$HAYABUSA_BIN" ]; then
+        echo "[!] Konnte Hayabusa-Binary nicht finden."
+        ls -lR "$HAYABUSA_DIR" || true
         exit 1
       fi
+    - chmod +x "$HAYABUSA_BIN"
 
-    # Hayabusa Scan ausführen
-    - echo "[*] Starte Hayabusa Scan..."
-    - ./$HAYABUSA_DIR/hayabusa.exe scan $EVENT_LOG --json $REPORT_PATH
-
-    # Bericht prüfen
+    # Prüfe Eingabe (Datei oder Verzeichnis)
     - |
-      if [ ! -f "$REPORT_PATH" ]; then
-        echo "[!] Hayabusa Bericht nicht erstellt!"
+      if [ -f "$EVENT_LOG" ]; then
+        INPUT_FLAG="-f"
+      elif [ -d "$EVENT_LOG" ]; then
+        INPUT_FLAG="-d"
+      else
+        echo "[!] Eventlog-Pfad nicht gefunden: $EVENT_LOG"
         exit 1
       fi
+      echo "[+] Eingabe erkannt: $INPUT_FLAG $EVENT_LOG"
 
-    # Bericht an NiNa API senden
-    - echo "[*] Sende Bericht an NiNa..."
+    # Hayabusa Scan (HTML-Report)
+    - echo "[*] Starte Hayabusa Scan (HTML-Export)..."
+    - mkdir -p "$REPORT_DIR"
+    - "$HAYABUSA_BIN" csv-timeline "$INPUT_FLAG" "$EVENT_LOG" -H "$REPORT_HTML" -o "$REPORT_DIR"
+
+    # Report prüfen
     - |
-      python3 <<EOF
-      import json
+      if [ ! -f "$REPORT_DIR/$REPORT_HTML" ]; then
+        echo "[!] HTML-Report nicht gefunden unter $REPORT_DIR/$REPORT_HTML"
+        find "$REPORT_DIR" -type f -name "$REPORT_HTML" -print
+        exit 1
+      fi
+      echo "[+] Report: $REPORT_DIR/$REPORT_HTML"
+
+    # HTML -> Text extrahieren und an NiNa senden
+    - echo "[*] Sende extrahierten HTML-Text an NiNa..."
+    - |
+      python3 <<'EOF'
+      import sys, re
+      from pathlib import Path
       import requests
+      try:
+          from bs4 import BeautifulSoup
+      except Exception:
+          BeautifulSoup = None
 
-      with open("$REPORT_PATH", "r", encoding="utf-8") as f:
-          report = json.load(f)
+      report_path = Path("$REPORT_DIR") / "$REPORT_HTML"
+      html = report_path.read_text(encoding="utf-8", errors="ignore")
 
+      def html_to_text(h):
+          if BeautifulSoup:
+              soup = BeautifulSoup(h, "html.parser")
+              for t in soup(["script","style","noscript"]): t.decompose()
+              txt = soup.get_text(separator="\n", strip=True)
+          else:
+              txt = re.sub(r"(?is)<(script|style).*?</\\1>", "", h)
+              txt = re.sub(r"(?s)<[^>]+>", "\n", txt)
+              txt = re.sub(r"\n{2,}", "\n", txt).strip()
+          # begrenzen, um API-Limits zu schonen
+          return (txt[:500_000] + "\n...[gekürzt]") if len(txt) > 500_000 else txt
+
+      text = html_to_text(html)
+
+      payload = {
+          "input": text,
+          "instruction": (
+              "Bewerte den folgenden Hayabusa-HTML-Report (als Text extrahiert) "
+              "nach Kritikalität, fasse Kernergebnisse zusammen, priorisiere nach Risiko/Impact "
+              "und gib konkrete Maßnahmen. Führe, wo möglich, Event-IDs/ATT&CK-Techniques an."
+          )
+      }
       headers = {"Content-Type": "application/json"}
+      resp = requests.post("$NINA_API_URL", headers=headers, json=payload, timeout=300)
 
-      response = requests.post(
-          "$NINA_API_URL",
-          headers=headers,
-          json={
-              "input": json.dumps(report),
-              "instruction": "Bewerte den Bericht nach Kritikalität."
-          }
-      )
-
-      if response.status_code != 200:
-          print(f"[!] API Fehler: {response.status_code}")
-          print(response.text)
-          exit(1)
+      if resp.status_code != 200:
+          print(f"[!] API Fehler: {resp.status_code}")
+          print(resp.text)
+          sys.exit(1)
 
       print("\n[+] NiNa Bewertung:")
-      print(response.json().get("output") or response.json())
+      data = resp.json()
+      print(data.get("output") or data)
       EOF
   artifacts:
     paths:
-      - hayabusa_report.json
+      - hayabusa_report/
     expire_in: 1 week
