@@ -1,3 +1,7 @@
+
+#Hierbei handelt es sich um eine beispielhafte Implementierung. Der Quell-Code muss auf die Zielumgebung angepasst werden.
+
+# === Konfiguration ===
 stages:
   - analyze
 
@@ -6,34 +10,30 @@ variables:
   HAYABUSA_URL: "https://github.com/Yamato-Security/hayabusa/releases/latest/download/hayabusa-lin-x64-gnu.zip"
   HAYABUSA_DIR: "hayabusa"
   # EVENT_LOG kann Datei ODER Verzeichnis sein (liegt im Repo oder als Artifact vor)
-  EVENT_LOG: "security.evtx"
-  REPORT_DIR: "hayabusa_report"
+  EVTX_DIR: "/builds/cert/forensic_scan/evtx" # Update this path to your directory
+  OUTPUT_DIR: "/builds/cert/forensic_scan/hayabusa_output"
   REPORT_HTML: "report.html"
   NINA_API_URL: "http://open-webui.local/api/nina/evaluate"
 
+
+  # === Schritt 0: Hayabusa herunterladen ===
 analyze_eventlog:
   stage: analyze
   image: python:3.10
   script:
+    
     - apt-get update && apt-get install -y unzip curl ca-certificates && update-ca-certificates
     - pip install --no-cache-dir requests beautifulsoup4
 
     # Hayabusa herunterladen
     - echo "[*] Lade Hayabusa (Linux x64) herunter..."
-    - mkdir -p "$HAYABUSA_DIR"
-    - curl -L "$HAYABUSA_URL" -o hayabusa.zip
-    - unzip -q hayabusa.zip -d "$HAYABUSA_DIR"
+    - apt-get update && apt-get install -y unzip git
+    # 
+    - wget https://github.com/Yamato-Security/hayabusa/releases/download/v2.19.0/hayabusa-2.19.0-lin-x64-gnu.zip
+    - unzip hayabusa-2.19.0-lin-x64-gnu.zip
+    - chmod +x ./hayabusa-2.19.0-lin-x64-gnu
 
-    # Executable finden (Versionsname variiert), ausführbar machen
-    - HAYABUSA_BIN="$(find "$HAYABUSA_DIR" -type f -maxdepth 2 -name 'hayabusa*-lin-*-gnu' -print -quit)"
-    - |
-      if [ -z "$HAYABUSA_BIN" ]; then
-        echo "[!] Konnte Hayabusa-Binary nicht finden."
-        ls -lR "$HAYABUSA_DIR" || true
-        exit 1
-      fi
-    - chmod +x "$HAYABUSA_BIN"
-
+# === Schritt 1: Eventlog prüfen ===
     # Prüfe Eingabe (Datei oder Verzeichnis)
     - |
       if [ -f "$EVENT_LOG" ]; then
@@ -46,19 +46,19 @@ analyze_eventlog:
       fi
       echo "[+] Eingabe erkannt: $INPUT_FLAG $EVENT_LOG"
 
-    # Hayabusa Scan (HTML-Report)
-    - echo "[*] Starte Hayabusa Scan (HTML-Export)..."
-    - mkdir -p "$REPORT_DIR"
-    - "$HAYABUSA_BIN" csv-timeline "$INPUT_FLAG" "$EVENT_LOG" -H "$REPORT_HTML" -o "$REPORT_DIR"
-
-    # Report prüfen
+# === Schritt 2: Hayabusa Scan durchführen ===
+ # Hayabusa Scan (HTML-Report)
     - |
-      if [ ! -f "$REPORT_DIR/$REPORT_HTML" ]; then
-        echo "[!] HTML-Report nicht gefunden unter $REPORT_DIR/$REPORT_HTML"
-        find "$REPORT_DIR" -type f -name "$REPORT_HTML" -print
-        exit 1
-      fi
-      echo "[+] Report: $REPORT_DIR/$REPORT_HTML"
+    - printf "3\nyes\n"  | script -q -c "./hayabusa-2.19.0-lin-x64-gnu csv-timeline -H report.html -d ${EVTX_DIR} -o ${OUTPUT_DIR}"  /dev/null
+
+      # === Schritt 3: Bericht laden ===
+    - |
+      if [ ! -f "$OUTPUT_DIR/$REPORT_HTML" ]; then
+          echo "[!] HTML-Report nicht gefunden unter $OUTPUT_DIR/$REPORT_HTML"
+          find "$OUTPUT_DIR" -type f -name "$REPORT_HTML" -print
+          exit 1
+        fi
+        echo "[+] Report: $OUTPUT_DIR/$REPORT_HTML"
 
     # HTML -> Text extrahieren und an NiNa senden
     - echo "[*] Sende extrahierten HTML-Text an NiNa..."
@@ -72,7 +72,7 @@ analyze_eventlog:
       except Exception:
           BeautifulSoup = None
 
-      report_path = Path("$REPORT_DIR") / "$REPORT_HTML"
+      report_path = Path("$OUTPUT_DIR") / "$REPORT_HTML"
       html = report_path.read_text(encoding="utf-8", errors="ignore")
 
       def html_to_text(h):
@@ -89,12 +89,15 @@ analyze_eventlog:
 
       text = html_to_text(html)
 
+
+
+        # === Schritt 4: Bericht an NiNa senden ===
+
       payload = {
           "input": text,
           "instruction": (
               "Bewerte den folgenden Hayabusa-HTML-Report (als Text extrahiert) "
-              "nach Kritikalität, fasse Kernergebnisse zusammen, priorisiere nach Risiko/Impact "
-              "und gib konkrete Maßnahmen. Führe, wo möglich, Event-IDs/ATT&CK-Techniques an."
+              "nach Kritikalität."
           )
       }
       headers = {"Content-Type": "application/json"}
